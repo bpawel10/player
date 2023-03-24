@@ -1,19 +1,57 @@
-import { fetch, ResponseType } from '@tauri-apps/api/http';
-import $ from 'jquery';
-import { parseISO } from 'date-fns';
+import { Body, fetch, ResponseType } from '@tauri-apps/api/http';
+import { format, isAfter, parse } from 'date-fns';
 import { UnrecognizedUrlException } from '../constants';
 import { interval, mergeMap, Observable, throwError } from 'rxjs';
 import { IChat, IMessage } from '../interfaces';
 
 export enum WykopChatFeedType {
-  BEST = 'najlepsze',
-  ALL = 'wszystkie',
+  BEST = 'best',
+  ALL = 'all',
 }
 
 export class WykopChat implements IChat {
   private static FETCH_MESSAGES_INTERVAL_BEST = 10 * 1000;
   private static FETCH_MESSAGES_INTERVAL_ALL = 1 * 1000;
   private static DOMAINS = ['wykop.pl', 'www.wykop.pl'];
+  private static API_KEYS_FILE_URL =
+    'https://wykop.pl/static/js/vendor.62eaf5fdda64ac237769.js';
+  private static API_V3_AUTH_URL = 'https://wykop.pl/api/v3/auth';
+  private static API_V3_GET_MESSAGES_URL = (
+    tag: string,
+    feedType: WykopChatFeedType,
+  ) => `https://wykop.pl/api/v3/tags/${tag}/stream?sort=${feedType}`;
+  private static API_V3_GET_NEW_MESSAGES_COUNT_URL = (
+    tag: string,
+    feedType: WykopChatFeedType,
+    date: string,
+  ) =>
+    `https://wykop.pl/api/v3/tags/${tag}/newer?type=${feedType}&date=${date}`;
+
+  async getAccessToken(): Promise<string> {
+    const { data } = await fetch<string>(WykopChat.API_KEYS_FILE_URL, {
+      method: 'GET',
+      responseType: ResponseType.Text,
+    });
+
+    const [, , base64EncodedKey, base64EncodedSecret] = data.match(
+      /(apiClientId:"(.+?)",apiClientSecret:"(.+?)")/,
+    )!;
+
+    const key = window.atob(base64EncodedKey);
+    const secret = window.atob(base64EncodedSecret);
+
+    const {
+      data: {
+        data: { token },
+      },
+    } = await fetch<{ data: { token: string } }>(WykopChat.API_V3_AUTH_URL, {
+      method: 'POST',
+      body: Body.json({ data: { key, secret } }),
+      responseType: ResponseType.JSON,
+    });
+
+    return token;
+  }
 
   async parse({ hostname, pathname }: URL): Promise<Observable<IMessage>> {
     if (!WykopChat.DOMAINS.includes(hostname)) {
@@ -26,10 +64,12 @@ export class WykopChat implements IChat {
     let feedType = feedTypeString as WykopChatFeedType;
 
     if (!Object.values(WykopChatFeedType).includes(feedType)) {
-      feedType = WykopChatFeedType.BEST;
+      feedType = WykopChatFeedType.ALL;
     }
 
-    let lastMessage = await WykopChat.getLastMessage(tag, feedType);
+    const token = await this.getAccessToken();
+
+    let lastMessage = await WykopChat.getLastMessage(tag, feedType, token);
 
     return interval(
       feedType === WykopChatFeedType.BEST
@@ -42,15 +82,16 @@ export class WykopChat implements IChat {
             tag,
             feedType,
             lastMessage,
+            token,
           );
 
           if (messages.length) {
-            lastMessage = messages.at(-1)!;
+            lastMessage = messages.at(0)!;
           }
 
           return messages;
         } catch (err) {
-          return throwError(() => ({}));
+          return throwError(() => err);
         }
       }),
       mergeMap((messages) => messages),
@@ -59,98 +100,81 @@ export class WykopChat implements IChat {
 
   static async getLastMessage(
     tag: string,
-    feedType: string,
+    feedType: WykopChatFeedType,
+    token: string,
   ): Promise<IMessage> {
-    const { data } = await fetch<string>(
-      `https://wykop.pl/tag/${tag}/${feedType}`,
-      {
-        method: 'GET',
-        responseType: ResponseType.Text,
+    const messages = await this.getMessages(tag, feedType, token);
+    return messages.at(0)!;
+  }
+
+  static async getMessages(
+    tag: string,
+    feedType: WykopChatFeedType,
+    token: string,
+  ): Promise<IMessage[]> {
+    const url = WykopChat.API_V3_GET_MESSAGES_URL(tag, feedType);
+    const {
+      data: { data },
+    } = await fetch<{ data: Record<string, any>[] }>(url, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${token}`,
       },
-    );
+      responseType: ResponseType.JSON,
+    });
 
-    const lastEntry = $(data)
-      .find('.comments-stream')
-      .children('.entry')
-      .first();
-
-    const lastMessage = this.parseEntry(lastEntry);
-
-    return lastMessage;
+    return data
+      .filter(({ content }) => content)
+      .map(this.parseEntry)
+      .filter(({ text, imageUrl }) => text?.length || imageUrl);
   }
 
   static async fetchMessages(
     tag: string,
-    feedType: string,
+    feedType: WykopChatFeedType,
     lastMessage: IMessage,
+    token: string,
   ): Promise<IMessage[]> {
-    const url = `https://www.wykop.pl/ajax2/tag/recent/tag/${tag}/method/index/popular/${
-      feedType === WykopChatFeedType.BEST ? '1' : '0'
-    }/user/0/type/entry/id/${lastMessage.id}/html/1`;
-
-    const { data } = await fetch<string>(url, {
+    const date = format(lastMessage.date!, 'yyyy-MM-dd+HH:mm:ss');
+    const url = WykopChat.API_V3_GET_NEW_MESSAGES_COUNT_URL(
+      tag,
+      feedType,
+      date,
+    );
+    const {
+      data: {
+        data: { count },
+      },
+    } = await fetch<{ data: { count: string } }>(url, {
       method: 'GET',
-      responseType: ResponseType.Text,
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+      responseType: ResponseType.JSON,
     });
 
-    const json: {
-      operations: {
-        type: string;
-        method: string;
-        data: { count?: number; html?: string };
-      }[];
-    } = JSON.parse(data.substring(8));
-
-    const response = json.operations.find(
-      ({ type, method }) =>
-        type === 'callback' && method === 'handleDefaultAjaxRefresh',
-    );
-
-    const html = response?.data?.html;
-
-    const messages = [];
-
-    if (html) {
-      messages.push(
-        ...$(html)
-          .children('.entry')
-          .toArray()
-          .map((entry) => this.parseEntry($(entry)))
-          .filter(({ text, imageUrl }) => text || imageUrl)
-          .reverse(),
-      );
+    if (!count) {
+      return [];
     }
 
-    return messages;
+    const messages = await this.getMessages(tag, feedType, token);
+
+    return messages.filter(({ date }) => isAfter(date!, lastMessage.date!));
   }
 
-  static parseEntry(entry: JQuery<HTMLElement>): IMessage {
-    const id = entry.find('div[data-type="entry"]').data('id');
-    const date = entry
-      .find('div > div > div.author > a > small > time')
-      .first()
-      .attr('datetime');
-    const author = entry.find('div > div > div.author > a > b').first().text();
-    const text = entry
-      .find('div > div > div.text > p')
-      .first()
-      .children()
-      .remove()
-      .end()
-      .text()
-      .replaceAll('#', '')
-      .trim();
-    const imageUrl = entry
-      .find('div > div > div.text div.media-content img')
-      .first()
-      .attr('src');
-
+  static parseEntry(entry: Record<string, any>): IMessage {
     return {
-      id,
-      date: date ? parseISO(date) : undefined,
-      author,
-      text,
-      imageUrl,
+      id: entry.id,
+      date: parse(entry.created_at, 'yyyy-MM-dd HH:mm:ss', new Date()),
+      author: entry.author.username,
+      text: entry.content
+        .replaceAll('(\n)+', ' ')
+        .replaceAll(/#[a-z0-9]+/g, '')
+        .replaceAll(/\[\*\*(LINK|MIRROR)\*\*\]\(.+?\)/g, '')
+        .replaceAll(/\[.+?\]\((.+?)\)/g, '$1')
+        .replaceAll(/\*\*(.+?)\*\*/g, '$1') // TODO: handle bold text better
+        .trim(),
+      imageUrl: entry?.media?.photo?.url,
     };
   }
 }
