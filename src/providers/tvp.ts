@@ -8,9 +8,11 @@ export class Tvp implements IVideo {
       responseType: ResponseType.Text,
     });
 
-    const [, , videoId] = data
-      .replace(/\s+/g, '')
-      .match(/"(video_id|_id)":(\d+)/)!;
+    const dataWithoutWhitespaces = data.replace(/\s+/g, '');
+
+    const [, videoId] =
+      dataWithoutWhitespaces.match(/"video_id":(\d+)/) ||
+      dataWithoutWhitespaces.match(/"_id":(\d+)/)!;
 
     const { data: json } = await fetch<Record<string, any>>(
       `https://api.tvp.pl/tokenizer/token/${videoId}`,
